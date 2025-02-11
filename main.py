@@ -21,6 +21,11 @@ class Storage:
     def __init__(self):
         self.channels: dict[str, Channel] = {}
 
+    async def register_channel(self, channel_name: str):
+        if channel_name in self.channels:
+            raise ValueError(f"Channel {channel_name} already exists")
+        self.channels[channel_name] = Channel(name=channel_name)
+
     async def get_message(self, channel_name: str) -> Optional[Message]:
         if channel_name not in self.channels:
             return None
@@ -33,9 +38,7 @@ class Storage:
         if channel_name in self.channels:
             self.channels[channel_name].ready_messages[message._id] = message
         else:
-            chan = Channel(name=channel_name)
-            chan.ready_messages[message._id] = message
-            self.channels[channel_name] = chan
+            raise ValueError(f"Channel {channel_name} does not exist")
 
     async def confirm_message(self, channel_name: str,
                               message_id: str) -> bool:
@@ -78,15 +81,25 @@ class Broker:
     async def route(self, scope, receive):
         body = await self.read_body(receive)
 
+        if scope.get('path') == '/register':
+            try:
+                await self.storage.register_channel(body.get('channel'))
+                return f'Channel {body.get('channel')} successfully registred'
+            except ValueError as err:
+                return str(err)
+
         if scope.get('path') == '/send':
             message = Message.model_validate(body)
-            await self.storage.put_message(body.get('channel'), message)
-            return {'message': message.data, 'message_id': message._id}
+            try:
+                await self.storage.put_message(body.get('channel'), message)
+                return {'data': message.data, 'message_id': message._id}
+            except ValueError as err:
+                return str(err)
 
         if scope.get('path') == '/read':
             message = await self.storage.get_message(body.get('channel'))
             if message:
-                return {'message': message.data, 'message_id': message._id}
+                return {'data': message.data, 'message_id': message._id}
             else:
                 return 'No messages in channel'
 
