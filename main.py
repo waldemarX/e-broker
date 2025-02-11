@@ -1,43 +1,27 @@
 import json
-import logging
-from typing import Any
 from uuid import uuid4
+from typing import Any, Optional
 from collections import OrderedDict
 
 from pydantic import BaseModel, PrivateAttr
 
 
-console_out = logging.StreamHandler()
-logging.basicConfig(handlers=[console_out],
-                    format="[%(levelname)s]: %(message)s",
-                    level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-AnyJSON = dict[str, Any]
-
-
 class Message(BaseModel):
     _id: str = PrivateAttr(default_factory=lambda: str(uuid4()))
-    message: AnyJSON
+    data: dict[str, Any]
 
 
-class Channel:
-    def __init__(self, name: str):
-        self.name: str = name
-        self.ready_messages: OrderedDict[str, Message] = OrderedDict()
-        self.unacked_messages: OrderedDict[str, Message] = OrderedDict()
-
-    def __repr__(self):
-        return f'Channel(name={self.name}, ' \
-               f'ready_messages={self.ready_messages}, ' \
-               f'unacked_messages={self.unacked_messages})'
+class Channel(BaseModel):
+    name: str
+    ready_messages: OrderedDict[str, Message] = OrderedDict()
+    unacked_messages: OrderedDict[str, Message] = OrderedDict()
 
 
 class Storage:
     def __init__(self):
         self.channels: dict[str, Channel] = {}
 
-    async def get_message(self, channel_name: str):
+    async def get_message(self, channel_name: str) -> Optional[Message]:
         if channel_name not in self.channels:
             return None
         if messages := self.channels[channel_name].ready_messages:
@@ -45,7 +29,7 @@ class Storage:
             self.channels[channel_name].unacked_messages[message._id] = message
             return message
 
-    async def put_message(self, channel_name: str, message: Message):
+    async def put_message(self, channel_name: str, message: Message) -> None:
         if channel_name in self.channels:
             self.channels[channel_name].ready_messages[message._id] = message
         else:
@@ -53,13 +37,14 @@ class Storage:
             chan.ready_messages[message._id] = message
             self.channels[channel_name] = chan
 
-    async def confirm_message(self, channel_name: str, message_id: str):
+    async def confirm_message(self, channel_name: str,
+                              message_id: str) -> bool:
         if channel_name not in self.channels:
-            return None
-        if self.channels[channel_name].unacked_messages.get(message_id):
-            del self.channels[channel_name].unacked_messages[message_id]
+            return False
+        return self.channels[channel_name].unacked_messages.pop(message_id,
+                                                                False)
 
-    async def purge_channel_messages(self, channel_name: str):
+    async def purge_channel_messages(self, channel_name: str) -> None:
         if channel_name in self.channels:
             self.channels[channel_name].ready_messages.clear()
             self.channels[channel_name].unacked_messages.clear()
@@ -72,8 +57,7 @@ class Broker:
     async def __call__(self, scope, receive, send):
         assert scope['type'] == 'http'
 
-        result = await self.route(scope, receive, send)
-        logger.info(self.storage.channels)
+        result = await self.route(scope, receive)
 
         await send({
             'type': 'http.response.start',
@@ -91,25 +75,28 @@ class Broker:
             'body': bytes(f"{dict(result=result)}", encoding="utf-8"),
         })
 
-    async def route(self, scope, receive, send):
+    async def route(self, scope, receive):
         body = await self.read_body(receive)
 
         if scope.get('path') == '/send':
             message = Message.model_validate(body)
             await self.storage.put_message(body.get('channel'), message)
-            return {'message': message.message, 'message_id': message._id}
+            return {'message': message.data, 'message_id': message._id}
 
         if scope.get('path') == '/read':
             message = await self.storage.get_message(body.get('channel'))
             if message:
-                return {'message': message.message, 'message_id': message._id}
+                return {'message': message.data, 'message_id': message._id}
             else:
                 return 'No messages in channel'
 
         if scope.get('path') == '/confirm':
-            await self.storage.confirm_message(body.get('channel'),
-                                               body.get('message_id'))
-            return 'Message confirmed!'
+            result = await self.storage.confirm_message(body.get('channel'),
+                                                        body.get('message_id'))
+            if result:
+                return 'Message confirmed!'
+            else:
+                return 'No such message'
 
         if scope.get('path') == '/purge':
             await self.storage.purge_channel_messages(body.get('channel'))
