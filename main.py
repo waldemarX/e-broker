@@ -21,7 +21,7 @@ class Storage:
     def __init__(self):
         self.channels: dict[str, Channel] = {}
 
-    async def register_channel(self, channel_name: str):
+    async def register_channel(self, channel_name: str) -> None:
         if channel_name in self.channels:
             raise ValueError(f"Channel {channel_name} already exists")
         self.channels[channel_name] = Channel(name=channel_name)
@@ -52,12 +52,37 @@ class Storage:
             self.channels[channel_name].ready_messages.clear()
             self.channels[channel_name].unacked_messages.clear()
 
+    async def get_stats(self, channel_name: Optional[str]) -> dict[str, int]:
+        stats_data = {}
+        if channel_name is None:
+            for channel in self.channels.values():
+                stats_data[channel.name] = {
+                    "ready_messages": len(channel.ready_messages),
+                    "unacked_messages": len(channel.unacked_messages),
+                    "total": len(channel.ready_messages) + len(channel.unacked_messages)
+                }
+        elif channel_name and channel_name in self.channels:
+            channel = self.channels[channel_name]
+            stats_data[channel_name] = {
+                "ready_messages": len(channel.ready_messages),
+                "unacked_messages": len(channel.unacked_messages),
+                "total": len(channel.ready_messages) + len(channel.unacked_messages)
+            }
+        return stats_data
+
+
+class Response(BaseModel):
+    data: dict[str, Any] = {}
+    message: str = ""
+    error: str = ""
+    message_id: str = ""
+
 
 class Broker:
     def __init__(self):
         self.storage = Storage()
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(self, scope, receive, send) -> None:
         assert scope['type'] == 'http'
 
         result = await self.route(scope, receive)
@@ -66,64 +91,70 @@ class Broker:
             'type': 'http.response.start',
             'status': 200,
             'headers': [
-                [b'content-type', b'text/plain'],
+                [b'Content-Type', b'application/json'],
             ],
         })
         await send({
             'type': 'http.response.body',
-            'status': 200,
-            'headers': [
-                [b'content-type', b'text/plain'],
-            ],
-            'body': bytes(f"{dict(result=result)}", encoding="utf-8"),
+            'body': json.dumps(result.model_dump()).encode('utf-8'),
         })
 
     async def route(self, scope, receive):
-        body = await self.read_body(receive)
+        request = await receive()
+        body = json.loads(request.get('body', b''))
 
-        if scope.get('path') == '/register':
-            try:
-                await self.storage.register_channel(body.get('channel'))
-                return f'Channel {body.get('channel')} successfully registred'
-            except ValueError as err:
-                return str(err)
+        handlers = {
+            '/register': self.register,
+            '/send': self.send,
+            '/read': self.read,
+            '/confirm': self.confirm,
+            '/purge': self.purge,
+            '/stats': self.stats
+        }
 
-        if scope.get('path') == '/send':
-            message = Message.model_validate(body)
-            try:
-                await self.storage.put_message(body.get('channel'), message)
-                return {'data': message.data, 'message_id': message._id}
-            except ValueError as err:
-                return str(err)
+        path = scope.get('path')
+        if path in handlers:
+            return await handlers[path](body)
+        else:
+            return Response(error='Unknown path')
 
-        if scope.get('path') == '/read':
-            message = await self.storage.get_message(body.get('channel'))
-            if message:
-                return {'data': message.data, 'message_id': message._id}
-            else:
-                return 'No messages in channel'
+    async def register(self, body):
+        try:
+            await self.storage.register_channel(body.get('channel'))
+            return Response(message=f'Channel {body.get("channel")} successfully registred')
+        except ValueError as err:
+            return Response(error=str(err))
 
-        if scope.get('path') == '/confirm':
-            result = await self.storage.confirm_message(body.get('channel'),
-                                                        body.get('message_id'))
-            if result:
-                return 'Message confirmed!'
-            else:
-                return 'No such message'
+    async def send(self, body):
+        message = Message.model_validate(body)
+        try:
+            await self.storage.put_message(body.get('channel'), message)
+            return Response(data=message.data, message_id=message._id)
+        except ValueError as err:
+            return Response(error=str(err))
 
-        if scope.get('path') == '/purge':
-            await self.storage.purge_channel_messages(body.get('channel'))
+    async def read(self, body):
+        message = await self.storage.get_message(body.get('channel'))
+        if message:
+            return Response(data=message.data, message_id=message._id)
+        else:
+            return Response(message='No messages in channel')
 
-    async def read_body(self, receive):
-        body = b''
-        more_body = True
+    async def confirm(self, body):
+        result = await self.storage.confirm_message(
+            body.get('channel'), body.get('message_id')
+        )
+        if result:
+            return Response(message='Message confirmed!')
+        else:
+            return Response(message='No such message')
 
-        while more_body:
-            message = await receive()
-            body += message.get('body', b'')
-            more_body = message.get('more_body', False)
+    async def purge(self, body):
+        await self.storage.purge_channel_messages(body.get('channel'))
+        return Response(message='Channel purged')
 
-        return json.loads(body)
-
+    async def stats(self, body):
+        stats = await self.storage.get_stats(body.get('channel'))
+        return Response(data=stats)
 
 app = Broker()
