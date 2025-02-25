@@ -1,7 +1,7 @@
 import json
 from uuid import uuid4
 from typing import Any
-from collections import OrderedDict
+from collections import deque
 
 from pydantic import BaseModel, PrivateAttr
 
@@ -13,8 +13,8 @@ class Message(BaseModel):
 
 class Channel(BaseModel):
     name: str
-    ready_messages: OrderedDict[str, Message] = OrderedDict()
-    unacked_messages: OrderedDict[str, Message] = OrderedDict()
+    ready_messages: deque[Message] = deque()
+    unacked_messages: dict[str, Message] = dict()
 
 
 class Response(BaseModel):
@@ -82,7 +82,7 @@ class Broker:
         message = Message.model_validate(body)
         channel_name = body.get("channel")
         if channel_name in self.channels:
-            self.channels[channel_name].ready_messages[message._id] = message
+            self.channels[channel_name].ready_messages.append(message)
             return Response(data=message.data, message_id=message._id)
         else:
             return Response(error=f"Channel {channel_name} does not exist")
@@ -92,7 +92,7 @@ class Broker:
         if channel_name not in self.channels:
             return Response(message=f"Channel {channel_name} does not exist")
         if messages := self.channels[channel_name].ready_messages:
-            _, message = messages.popitem(last=False)
+            message = messages.popleft()
             self.channels[channel_name].unacked_messages[message._id] = message
             return Response(data=message.data, message_id=message._id)
         else:
